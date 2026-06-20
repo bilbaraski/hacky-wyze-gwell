@@ -14,7 +14,8 @@ COPY go.mod ./
 RUN go mod download 2>/dev/null || true
 COPY cmd/ cmd/
 COPY pkg/ pkg/
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /gwell-proxy ./cmd/gwell-proxy/
+# Build for the native platform (was hardcoded GOARCH=amd64, which breaks arm64 hosts like a Pi). (upstream fix candidate)
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /gwell-proxy ./cmd/gwell-proxy/
 
 # ---- Stage 2: Runtime image ----
 FROM alpine:3.21
