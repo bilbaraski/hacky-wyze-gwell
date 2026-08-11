@@ -153,17 +153,18 @@ type Session struct {
 	convCtrl uint32
 
 	// Stream counters
-	streamPkts      int
-	streamDataBytes int
-	lastDataFrom    string
-	bestLanAddr     *net.UDPAddr // best LAN address for KCP output (camera's actual IP:port)
-	meterRound      uint32       // per-session meter probe round counter
+	streamPkts           int
+	streamDataBytes      int
+	lastDataFrom         string
+	bestLanAddr          *net.UDPAddr // best LAN address for KCP output (camera's actual IP:port)
+	lastLanAddrConfirmed time.Time    // last time bestLanAddr was confirmed alive by inbound traffic
+	meterRound           uint32       // per-session meter probe round counter
 
 	// Diagnostics
-	rawUDPPkts      int64     // total raw UDP packets received during streaming
-	lastMeterRecv   time.Time // last time we received any meter frame (REQ or ACK)
-	meterReqCount   int       // incoming meter REQUESTs from camera (since last log)
-	meterAckCount   int       // incoming meter ACKs from camera (since last log)
+	rawUDPPkts    int64     // total raw UDP packets received during streaming
+	lastMeterRecv time.Time // last time we received any meter frame (REQ or ACK)
+	meterReqCount int       // incoming meter REQUESTs from camera (since last log)
+	meterAckCount int       // incoming meter ACKs from camera (since last log)
 
 	// Lifecycle
 	state  SessionState
@@ -1083,7 +1084,7 @@ func (s *Session) setupTransport(callingRelayIP net.IP, callingRelayPort uint16,
 // Like kcpOutputFn, prefers LAN direct and avoids flooding the P2P server.
 func (s *Session) sendMTP(data []byte) {
 	// If we have a confirmed best LAN address, use only that
-	if s.bestLanAddr != nil {
+	if s.bestLanAddr != nil && time.Since(s.lastLanAddrConfirmed) < 30*time.Second {
 		s.pc.WriteToUDP(data, s.bestLanAddr)
 		return
 	}
@@ -1152,7 +1153,7 @@ func (s *Session) streamLoop() error {
 		stdFrame := BuildMTPFrame(payload, false)
 
 		// If we have a confirmed best LAN address (from received data), use only that
-		if s.bestLanAddr != nil {
+		if s.bestLanAddr != nil && time.Since(s.lastLanAddrConfirmed) < 30*time.Second {
 			s.pc.WriteToUDP(stdFrame, s.bestLanAddr)
 			return
 		}
@@ -1273,6 +1274,7 @@ func (s *Session) streamLoop() error {
 						// Lock best LAN addr during INITREQ phase too
 						if isCameraLanIP(fromAddr.IP) && s.bestLanAddr == nil {
 							s.bestLanAddr = &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
+							s.lastLanAddrConfirmed = time.Now()
 							log.Printf("%s locked bestLanAddr: %s", s.prefix, s.bestLanAddr)
 						}
 					}
@@ -1405,7 +1407,9 @@ func (s *Session) streamLoop() error {
 			continue
 		}
 		s.rawUDPPkts++
-
+		if s.bestLanAddr != nil && fromAddr.IP.Equal(s.bestLanAddr.IP) && fromAddr.Port == s.bestLanAddr.Port {
+			s.lastLanAddrConfirmed = time.Now()
+		}
 		isFromServer := fromAddr.IP.Equal(s.serverUDPAddr.IP) && fromAddr.Port == s.serverUDPAddr.Port
 
 		if buf[0] == 0xC0 {
@@ -1423,6 +1427,7 @@ func (s *Session) streamLoop() error {
 					// SDK equivalent: mtpSession+0x5c (best addr from meter probing)
 					if isCameraLanIP(fromAddr.IP) && s.bestLanAddr == nil {
 						s.bestLanAddr = &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
+						s.lastLanAddrConfirmed = time.Now()
 						log.Printf("%s locked bestLanAddr: %s", s.prefix, s.bestLanAddr)
 					}
 				}

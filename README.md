@@ -120,6 +120,11 @@ wyze-gwell-bridge/
 **No video:** Verify the camera LAN IP is correct and reachable from the P2P container. The camera must be on the same network.
 
 **Stream dies after a few minutes:** Earlier versions had several issues causing streams to drop after 3–7 minutes. These have all been resolved — see the "Stream Stability" section in `wyze-p2p/IMPLEMENTATION_STATUS.md` for details. If you still see drops, check `docker compose logs wyze-p2p` for `dropAhead` counts or watchdog timeout messages.
+**Stream dies every ~2-3 minutes with `deadman timeout`:** This means the session fell back to Wyze's TCP relay servers, which have a hard ~2-3 minute session timeout by design. Set the camera's LAN IP manually so the client can use LAN-direct instead:
+```bash
+curl -X POST http://<API_IP>:8080/Camera/SetManualIP -H "Content-Type: application/json" -d '{"cameraId":"GW_...","ip":"192.168.x.x"}'
+```
+After setting it, restart `wyze-p2p` and check the logs for `using LAN direct` instead of `using TCP relay for MTP`. Without a manual LAN IP, every session is relay-only and will cycle every 2-3 minutes indefinitely — this is expected relay-server behavior, not a bug.
 
 **Multiple cameras:** The P2P client automatically discovers and streams all GWell cameras on your account. There's a 15-second stagger between camera connections to avoid P2P server rate limiting.
 
