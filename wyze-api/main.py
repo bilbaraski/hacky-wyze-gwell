@@ -1,5 +1,7 @@
 
 import os
+import re
+import subprocess
 import sys
 import logging
 from typing import Optional, Dict
@@ -10,6 +12,7 @@ from pydantic import BaseModel
 from wyze_sdk import Client
 from wyze_sdk.errors import WyzeClientError
 from wyze_sdk.service.base import WpkNetServiceClient
+from requests.exceptions import HTTPError
 import hashlib
 import wyze_sdk.signature
 
@@ -41,6 +44,8 @@ MARS_URL = os.getenv("MARS_URL", "https://wyze-mars-service.wyzecam.com") # Defa
 MARS_REGISTER_GW_USER_ROUTE = os.getenv("MARS_REGISTER_GW_USER_ROUTE", "/plugin/mars/v2/regist_gw_user/")
 # Original C# defaults: GW_BE1_, GW_GC1_, GW_GC2_. Using broader GW_ to catch all GWELL variants (DUO, etc.)
 VALID_MARS_DEVICE_PREFIX = os.getenv("VALID_MARS_DEVICE_PREFIX", "GW_") # Comma separated
+LAN_SUBNET = os.getenv("LAN_SUBNET", "192.168.0.0/24")
+LAN_SCAN_INTERFACE = os.getenv("LAN_SCAN_INTERFACE", "eth0")
 
 # Models
 class CameraInfo(BaseModel):
@@ -75,6 +80,55 @@ class ManualIPRequest(BaseModel):
     cameraId: str
     ip: str
 
+class UnreachableReport(BaseModel):
+    cameraId: str
+
+def mac_from_device_id(device_id: str) -> Optional[str]:
+    """GW_GC1 device IDs end in the camera's bare MAC (e.g. GW_GC1_D03F2775AC2F -> d0:3f:27:75:ac:2f)."""
+    match = re.search(r"([0-9A-Fa-f]{12})$", device_id)
+    if not match:
+        return None
+    hex_mac = match.group(1)
+    return ":".join(hex_mac[i:i + 2] for i in range(0, 12, 2)).lower()
+
+def detect_lan_interface() -> str:
+    """Finds which network interface actually holds an address in LAN_SUBNET.
+    Docker's interface naming (eth0 vs eth1 etc.) depends on network creation
+    order, not the order networks are listed in compose, so this can't be
+    hardcoded reliably — LAN_SCAN_INTERFACE is only a fallback if detection fails."""
+    try:
+        import ipaddress
+        net = ipaddress.ip_network(LAN_SUBNET, strict=False)
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] == "inet":
+                addr = parts[3].split("/")[0]
+                if ipaddress.ip_address(addr) in net:
+                    return parts[1]
+    except Exception as e:
+        logger.error(f"Failed to auto-detect LAN interface, falling back to {LAN_SCAN_INTERFACE}: {e}")
+    return LAN_SCAN_INTERFACE
+
+def discover_ip_by_mac(mac: str) -> Optional[str]:
+    """Runs arp-scan against the LAN to find the current IP for a known MAC address."""
+    iface = detect_lan_interface()
+    try:
+        result = subprocess.run(
+            ["arp-scan", "--interface", iface, "--quiet", "--plain", "--retry=2", LAN_SUBNET],
+            capture_output=True, text=True, timeout=30
+        )
+    except Exception as e:
+        logger.error(f"arp-scan failed to run: {e}")
+        return None
+
+    target = mac.lower()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].lower() == target:
+            return parts[0]
+    return None
+
 class WyzeManager:
     def __init__(self):
         self.client: Optional[Client] = None
@@ -84,6 +138,8 @@ class WyzeManager:
         # The IoTVideoSdk is very picky about this. Caching causes ASrv_tmpsubs_parse_fail (8020).
         self.supported_prefixes = [p.strip() for p in VALID_MARS_DEVICE_PREFIX.split(",") if p.strip()]
         self._ready = False  # Set True after startup prefetch completes
+        self._consecutive_mars_failures = 0
+        self._max_mars_failures = int(os.getenv("MAX_MARS_FAILURES", "3"))
 
     def login(self):
         if not self.client:
@@ -170,7 +226,7 @@ class WyzeManager:
             logger.error(f"Failed to refresh cameras: {e}")
             logger.exception("Traceback:")
 
-    def _fetch_token_from_mars(self, device_id: str) -> Optional[AccessCredential]:
+    def _fetch_token_from_mars(self, device_id: str, _retry: bool = True) -> Optional[AccessCredential]:
         """Makes the actual external API call to Wyze Mars. This is slow (2-4s)."""
         if not self.client:
             self.login()
@@ -204,16 +260,28 @@ class WyzeManager:
                  if "data" in data_dict:
                     data = data_dict["data"]
 
+                 self._consecutive_mars_failures = 0
                  return AccessCredential(
                     accessId=data["accessId"],
                     accessToken=data["accessToken"]
                  )
 
             logger.error(f"Failed to get token response for {device_id}: {resp}")
+            self._consecutive_mars_failures += 1
             return None
 
         except Exception as e:
             logger.exception(f"Error fetching Mars token for {device_id}: {e}")
+            self._consecutive_mars_failures += 1
+
+            is_auth_error = isinstance(e, HTTPError) and e.response is not None and e.response.status_code == 401
+            if is_auth_error and _retry:
+                logger.warning(f"Mars token fetch for {device_id} got 401 — forcing re-login and retrying once")
+                self.client = None
+                self.login()
+                if self.client:
+                    return self._fetch_token_from_mars(device_id, _retry=False)
+
             return None
 
 
@@ -231,6 +299,29 @@ class WyzeManager:
              new_cam = CameraInfo(cameraId=cam.cameraId, streamName=cam.streamName, lanIp=ip)
              self.cameras[device_id] = new_cam
         logger.info(f"Set manual IP for {device_id} to {ip}")
+
+    def rediscover_ip(self, device_id: str) -> dict:
+        """Called when a camera is reported unreachable. Re-resolves its LAN IP
+        by MAC via arp-scan and updates the manual override if it changed."""
+        mac = mac_from_device_id(device_id)
+        if not mac:
+            return {"status": "error", "detail": f"Could not derive MAC from {device_id}"}
+
+        old_ip = self.manual_ips.get(device_id)
+        logger.info(f"Rediscovering {device_id} (MAC {mac}) via arp-scan on {LAN_SUBNET}...")
+        new_ip = discover_ip_by_mac(mac)
+
+        if not new_ip:
+            logger.warning(f"arp-scan found no host for MAC {mac} ({device_id})")
+            return {"status": "not_found", "mac": mac, "oldIp": old_ip}
+
+        if new_ip == old_ip:
+            logger.info(f"{device_id} still at {old_ip} — no change")
+            return {"status": "unchanged", "mac": mac, "ip": new_ip}
+
+        logger.info(f"{device_id} moved: {old_ip} -> {new_ip}")
+        self.set_manual_ip(device_id, new_ip)
+        return {"status": "updated", "mac": mac, "oldIp": old_ip, "newIp": new_ip}
 
 
 manager = WyzeManager()
@@ -254,6 +345,11 @@ def startup_event():
 def health():
     if not manager._ready:
         raise HTTPException(status_code=503, detail="API starting up, cameras not yet discovered")
+    if manager._consecutive_mars_failures >= manager._max_mars_failures:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Wyze Mars auth failing ({manager._consecutive_mars_failures} consecutive errors) — session likely expired"
+        )
     return {"status": "ok", "cameras": len(manager.cameras)}
 
 
@@ -278,6 +374,14 @@ def get_camera_token_endpoint(deviceId: str):
 def set_manual_ip(req: ManualIPRequest):
     manager.set_manual_ip(req.cameraId, req.ip)
     return {"status": "updated", "cameraId": req.cameraId, "ip": req.ip}
+
+@app.post("/Camera/ReportUnreachable")
+def report_unreachable(req: UnreachableReport):
+    """Called by the P2P proxy when a camera stops responding at its known
+    LAN IP (e.g. deadman timeout). Re-resolves the IP by MAC via arp-scan —
+    only runs when something is actually broken, not on a schedule."""
+    result = manager.rediscover_ip(req.cameraId)
+    return {"cameraId": req.cameraId, **result}
 
 @app.get("/streams")
 def streams_dashboard():

@@ -277,6 +277,12 @@ func runCamera(client *wyze.Client, cameraID string,
 		err = streamCamera(client, cameraID, mediamtxHost, mediamtxPort, stopCh)
 		if err != nil {
 			log.Printf("[%s] Stream error: %v", cameraID, err)
+			// Camera may have moved to a new DHCP address — ask wyze-api to
+			// re-resolve it by MAC before we retry. Best-effort; a failure
+			// here just means we retry at the same IP as before.
+			if reportErr := client.ReportUnreachable(cameraID); reportErr != nil {
+				log.Printf("[%s] ReportUnreachable failed: %v", cameraID, reportErr)
+			}
 		}
 
 		select {

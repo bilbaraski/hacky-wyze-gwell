@@ -22,11 +22,18 @@ services:
   wyze-api:
     build: ./wyze-api
     restart: unless-stopped
+    labels:
+      - autoheal=true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
     volumes:
       - ./data:/app/data
     env_file: .env
     environment:
       - MEDIAMTX_HOST=${MEDIAMTX_IP}
+      - LAN_SUBNET=${LAN_SUBNET:-192.168.0.0/24}
+      - LAN_SCAN_INTERFACE=${LAN_INTERFACE:-eth0}
     networks:
       lan:
         ipv4_address: ${API_IP}
@@ -55,3 +62,16 @@ services:
       - CRYZE_API_URL=http://wyze-api:8080
       - MEDIAMTX_HOST=${MEDIAMTX_IP}
       - MEDIAMTX_PORT=8554
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=10
+      - AUTOHEAL_START_PERIOD=30
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - internal

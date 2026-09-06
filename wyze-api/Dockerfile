@@ -7,9 +7,12 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Install iproute2 for setting default route in macvlan mode
+# iproute2: setting default route in macvlan mode.
+# arp-scan: re-resolving a camera's LAN IP by MAC when it stops responding
+# (DHCP reassignment) — requires the container to run with NET_RAW/NET_ADMIN.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
+    arp-scan \
     ca-certificates \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*

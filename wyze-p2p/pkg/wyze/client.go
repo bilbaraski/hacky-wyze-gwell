@@ -1,6 +1,7 @@
 package wyze
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -85,4 +86,26 @@ func (c *Client) GetCameraToken(deviceID string) (*AccessCredential, error) {
 		return nil, fmt.Errorf("decode camera token: %w", err)
 	}
 	return &cred, nil
+}
+
+// ReportUnreachable tells wyze-api that this camera stopped responding at its
+// known LAN IP, so it can re-resolve the IP by MAC (arp-scan) before the next
+// reconnect attempt. Best-effort: callers should log failures, not abort on them.
+func (c *Client) ReportUnreachable(deviceID string) error {
+	body, err := json.Marshal(map[string]string{"cameraId": deviceID})
+	if err != nil {
+		return fmt.Errorf("marshal report body: %w", err)
+	}
+
+	resp, err := c.httpClient.Post(c.baseURL+"/Camera/ReportUnreachable", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("POST /Camera/ReportUnreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("report unreachable %s: HTTP %d: %s", deviceID, resp.StatusCode, string(respBody))
+	}
+	return nil
 }
