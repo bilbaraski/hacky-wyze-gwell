@@ -4,3 +4,10 @@ data/*
 *.log
 CLAUDE.md
 wyze-p2p/gwell-proxy
+
+# local edit backups
+*.bak-*
+__pycache__/
+
+# monitor runtime output (events.log already covered by *.log)
+monitor/health.csv

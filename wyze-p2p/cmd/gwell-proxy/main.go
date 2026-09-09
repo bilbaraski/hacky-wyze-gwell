@@ -34,7 +34,11 @@ const (
 	defaultMediamtxHost  = "localhost"
 	defaultMediamtxPort  = 8554
 	tokenRefreshInterval = 1 * time.Hour
-	deadmanTimeout       = 120 * time.Second
+	// A healthy stream delivers frames continuously, so silence for this long
+	// means the session is gone, not slow. 120s here dominated recovery time:
+	// a drop cost ~145s of black screen (120s detect + 10s backoff + handshake)
+	// when re-handshaking only takes ~15-20s.
+	deadmanTimeout       = 25 * time.Second
 	cameraStagger        = 15 * time.Second
 	reconnectDelay       = 10 * time.Second
 	cacheFile            = "data/token_cache.json"

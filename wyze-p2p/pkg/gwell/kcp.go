@@ -84,6 +84,7 @@ type KCPConn struct {
 	// Congestion
 	cwnd    uint32
 	ssthresh uint32
+	incr    uint32 // byte counter for congestion-avoidance growth (see flush)
 
 	// Buffers
 	sndQueue []*kcpSeg
@@ -223,6 +224,7 @@ func (kcp *KCPConn) Input(data []byte) int {
 
 	var maxACK uint32
 	hasACK := false
+	prevUna := kcp.sndUna
 
 	for len(data) >= IKCP_OVERHEAD {
 		conv := binary.LittleEndian.Uint32(data[0:4])
@@ -311,6 +313,10 @@ func (kcp *KCPConn) Input(data []byte) int {
 				seg.fastack++
 			}
 		}
+	}
+
+	if itimediff(kcp.sndUna, prevUna) > 0 {
+		kcp.growCwnd()
 	}
 
 	return 0
@@ -729,6 +735,7 @@ func (kcp *KCPConn) flushLocked() {
 			kcp.ssthresh = IKCP_THRESH_INIT
 		}
 		kcp.cwnd = kcp.ssthresh + resent
+		kcp.incr = kcp.cwnd * kcp.mss
 	}
 
 	if lost {
@@ -737,10 +744,41 @@ func (kcp *KCPConn) flushLocked() {
 			kcp.ssthresh = IKCP_THRESH_INIT
 		}
 		kcp.cwnd = 1
+		kcp.incr = kcp.mss
 	}
 
 	if kcp.cwnd < 1 {
 		kcp.cwnd = 1
+		kcp.incr = kcp.mss
+	}
+}
+
+// growCwnd advances the congestion window after our sent data has been
+// acknowledged: slow start below ssthresh, congestion avoidance above it.
+// Reference KCP runs this from Input() only when snd_una moved forward —
+// growing it unconditionally on every flush tick would mean no congestion
+// control at all, since the window would climb back regardless of whether
+// anything is actually getting through.
+func (kcp *KCPConn) growCwnd() {
+	if kcp.cwnd >= kcp.rmtWnd {
+		return
+	}
+	mss := kcp.mss
+	if kcp.cwnd < kcp.ssthresh {
+		kcp.cwnd++
+		kcp.incr += mss
+	} else {
+		if kcp.incr < mss {
+			kcp.incr = mss
+		}
+		kcp.incr += (mss*mss)/kcp.incr + mss/16
+		if (kcp.cwnd+1)*mss <= kcp.incr && mss > 0 {
+			kcp.cwnd = (kcp.incr + mss - 1) / mss
+		}
+	}
+	if kcp.cwnd > kcp.rmtWnd {
+		kcp.cwnd = kcp.rmtWnd
+		kcp.incr = kcp.rmtWnd * mss
 	}
 }
 

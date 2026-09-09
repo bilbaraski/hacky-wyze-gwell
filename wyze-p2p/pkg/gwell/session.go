@@ -1080,11 +1080,22 @@ func (s *Session) setupTransport(callingRelayIP net.IP, callingRelayPort uint16,
 	}
 }
 
+// lanStaleTimeout is how long we keep trusting a locked LAN address after the
+// last packet actually received from it. Past this we stop assuming the direct
+// path works and start mirroring traffic to the relay as well.
+const lanStaleTimeout = 30 * time.Second
+
+// lanPathFresh reports whether the locked LAN address is still confirmed alive
+// by recent inbound traffic from that exact address:port.
+func (s *Session) lanPathFresh() bool {
+	return s.bestLanAddr != nil && time.Since(s.lastLanAddrConfirmed) < lanStaleTimeout
+}
+
 // sendMTP sends an MTP frame to the camera via the best available path.
 // Like kcpOutputFn, prefers LAN direct and avoids flooding the P2P server.
 func (s *Session) sendMTP(data []byte) {
 	// If we have a confirmed best LAN address, use only that
-	if s.bestLanAddr != nil && time.Since(s.lastLanAddrConfirmed) < 30*time.Second {
+	if s.lanPathFresh() {
 		s.pc.WriteToUDP(data, s.bestLanAddr)
 		return
 	}
@@ -1094,10 +1105,13 @@ func (s *Session) sendMTP(data []byte) {
 		for _, addr := range s.lanMTPAddrs {
 			s.pc.WriteToUDP(data, addr)
 		}
-		return
+		// No return: fall through to the relay paths as well. The LAN path is
+		// unconfirmed here, and returning early means a camera that stopped
+		// answering on LAN never gets reached over the relay — the session
+		// just dies on the deadman timer instead.
 	}
 
-	// Fallback: no LAN addresses, use relay paths
+	// Fallback: LAN unconfirmed or unavailable, use relay paths
 	if s.tcpRelay != nil {
 		tcpData := make([]byte, len(data))
 		copy(tcpData, data)
@@ -1153,7 +1167,7 @@ func (s *Session) streamLoop() error {
 		stdFrame := BuildMTPFrame(payload, false)
 
 		// If we have a confirmed best LAN address (from received data), use only that
-		if s.bestLanAddr != nil && time.Since(s.lastLanAddrConfirmed) < 30*time.Second {
+		if s.lanPathFresh() {
 			s.pc.WriteToUDP(stdFrame, s.bestLanAddr)
 			return
 		}
@@ -1163,10 +1177,12 @@ func (s *Session) streamLoop() error {
 			for _, addr := range s.lanMTPAddrs {
 				s.pc.WriteToUDP(stdFrame, addr)
 			}
-			return
+			// No return — also try the relay below. These are KCP ACKs: if they
+			// stop reaching the camera it retransmits everything, which is the
+			// bulk of the duplicate traffic seen when a LAN path goes bad.
 		}
 
-		// Fallback: no LAN addresses available, use relay paths
+		// Fallback: LAN unconfirmed or unavailable, use relay paths
 		for _, rt := range s.udpRelayTargets {
 			extFrame := BuildExtendedMTPFrame(payload, s.targetDev.TID, false)
 			s.pc.WriteToUDP(extFrame, rt.Addr)

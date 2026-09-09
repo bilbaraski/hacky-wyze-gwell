@@ -14,6 +14,13 @@ services:
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
     restart: unless-stopped
+    environment:
+      # These cameras stall for a few seconds at a time. The 10s default tore
+      # the published path down (and killed ffmpeg with it) on stalls the p2p
+      # proxy would have ridden out on its own, turning a brief freeze into a
+      # full reconnect. Keep this at/below the proxy's deadmanTimeout so the
+      # proxy is what decides a session is dead.
+      - MTX_READTIMEOUT=25s
     networks:
       lan:
         ipv4_address: ${MEDIAMTX_IP}
@@ -62,6 +69,16 @@ services:
       - CRYZE_API_URL=http://wyze-api:8080
       - MEDIAMTX_HOST=${MEDIAMTX_IP}
       - MEDIAMTX_PORT=8554
+
+  monitor:
+    image: docker:cli
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/monitor/collect.sh"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./monitor:/monitor
+    networks:
+      - internal
 
   autoheal:
     image: willfarrell/autoheal:latest
