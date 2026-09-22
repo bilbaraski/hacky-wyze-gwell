@@ -14,6 +14,11 @@ services:
   mediamtx:
     image: bluenviron/mediamtx:latest-ffmpeg
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     environment:
       # These cameras stall for a few seconds at a time. The 10s default tore
       # the published path down (and killed ffmpeg with it) on stalls the p2p
@@ -29,6 +34,11 @@ services:
   wyze-api:
     build: ./wyze-api
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     labels:
       - autoheal=true
     cap_add:
@@ -55,6 +65,11 @@ services:
   wyze-p2p:
     build: ./wyze-p2p
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     depends_on:
       wyze-api:
         condition: service_healthy

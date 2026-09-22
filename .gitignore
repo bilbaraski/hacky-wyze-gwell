@@ -10,4 +10,4 @@ wyze-p2p/gwell-proxy
 __pycache__/
 
 # monitor runtime output (events.log already covered by *.log)
-monitor/health.csv
+monitor/health.csv*

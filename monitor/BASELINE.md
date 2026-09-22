@@ -1,63 +1,78 @@
-# Measurement window — started 2026-09-09 ~18:15 UTC
+# Stream health — measurement and findings
 
-## What to review
+## Result of the 2026-09-09 -> 09-22 window
 
-`monitor/health.csv` — one row per camera per 5 min. `monitor/events.log` — raw
-lifecycle lines for reconstructing outage durations.
+|                        | before (09-09) | after            |
+| ---------------------- | -------------- | ---------------- |
+| drop events            | ~180/day       | 0-9/day          |
+| median session length  | ~2-3 min       | 21h front / 9.7h kitchen |
+| duplicate rate         | ~40%           | 0.5%             |
+| HA-visible failures    | constant       | zero for 11 days |
 
-Columns that matter most:
+09-16, 09-17 and 09-18 recorded zero drop events. Longest unbroken session was
+92.4h — ~67M packets, no reconnect.
 
-- `deadman` / `ffmpeg_died` / `other_err` — session death events. This is the
-  headline number: how often does a stream drop.
-- `mtx_nostream` — HA-visible failures. Each one is a DESCRIBE that got
-  rejected, i.e. a camera card showing "wrong response on DESCRIBE".
-- `dup_pct` — share of received KCP segments that were duplicates of data we
-  already had. High means the camera is retransmitting because it isn't seeing
-  our ACKs.
-- `ack_pct` — share of our outbound meter probes that got answered. This is the
-  outbound-path health proxy. It was ~6-9% at the start of the window.
-- `path` — `lan` or `relay:<ip>`. If relay ever appears, the relay fallback
-  added on 09-09 is doing its job.
+## Which of the four changes actually did it
 
-Note `dup_pct` / `ack_pct` are cumulative per KCP session, not per 5-min window,
-so they reset when a session restarts and drift within a session. Compare
-like-for-like (e.g. value at a similar age into a session), or just watch the
-event counts, which are true per-window deltas.
+Four changes landed together on 09-09, so attribution had to come from the data.
 
-## Pre-change baseline (observed 2026-09-09, before the changes below)
+- **mediamtx `MTX_READTIMEOUT` 10s -> 25s — this is the one that mattered.**
+  The 10s default tore down the published path on a brief stall, which killed
+  ffmpeg, which killed the session, which forced a re-handshake. A cascade.
+  Absorb the stall and it never starts. Corroborated by the duplicate collapse:
+  duplicates concentrate in early-session, so when sessions stop churning the
+  rate falls off a cliff (the 74% once measured was 11s into a session).
+- **Relay fallback: used once** in 7,072 samples (`relay:52.20.100.241`,
+  09-19 20:22). Effectively inert. Caveat: `path` records where data was
+  *received*, so relay *sends* wouldn't appear — it can't be fully excluded,
+  but it is clearly not the mechanism.
+- **KCP cwnd growth: confirmed no-op.** `streamLoop` calls `NoDelay(0,5,10,1)`,
+  so `nc=1` disables the window, and the send queue is empty on this
+  receive-only workload. Kept for correctness, not effect.
+- **`deadmanTimeout` 120s -> 25s:** shortened recovery, as intended. Cannot
+  explain drops falling 20-95x — a more sensitive detector fires *more*, not
+  less.
 
-- Drop events: ~15 per 2 hours across both cameras
-- `dup_pct`: ~40%
-- `ack_pct`: ~24% (meter sent=59 / recvACK=14)
-- Recovery per drop: ~145s (120s deadman + 10s backoff + ~15s handshake)
-- Longest observed clean stretch: ~35 min
+## A metric that lied, now removed
 
-Caveat: the p2p container was recreated several times during that session, so
-these came from log observation rather than a clean recorded baseline. Treat as
-approximate.
+`ack_pct` (and `meter_ack`) were dropped from the CSV on 09-22. `meter_sent` is
+cumulative and climbs for the life of a session; `recvACK` stops incrementing
+after handshake and sits at ~15. The ratio therefore decays toward zero no
+matter how healthy the link is:
 
-## Changes made 2026-09-09 (all four within ~1 hour, so attribution is coupled)
+    00:04  sent=21365 ack=15
+    01:03  sent=23112 ack=15
 
-1. `deadmanTimeout` 120s -> 25s (`cmd/gwell-proxy/main.go`). Expected effect:
-   recovery ~145s -> ~50s. Should show up as shorter gaps in `events.log`, not
-   as fewer `deadman` events.
-2. KCP congestion-window growth moved from `flush()` to `Input()`, gated on
-   `sndUna` advancing (`pkg/gwell/kcp.go`). Correctness only — expected to
-   change nothing observable, since `NoDelay(0,5,10,1)` sets `nc=1` (congestion
-   control off) and the send queue is always empty on this workload.
-3. Relay fallback made reachable when the LAN path goes stale (`pkg/gwell/
-   session.go`). Previously the `len(lanMTPAddrs) > 0` branch always returned,
-   so the relay code below it was dead. Expected effect: fewer `deadman` events,
-   and `path` showing `relay:` during stalls.
-4. mediamtx `MTX_READTIMEOUT=25s` (was 10s default). Expected effect: stalls
-   between 10-25s no longer tear down the published path, so `mtx_nostream`
-   and `ffmpeg_died` should drop.
+This was read as "only 6-9% of outbound probes answered" and used to argue the
+outbound path was chronically broken — which motivated the relay work. It was
+an artifact. `dup_pct` at 0.5% is the load-bearing evidence: if the camera
+weren't receiving our ACKs it would retransmit, and it isn't. `meter_sent` is
+kept only as a session-age proxy.
 
-## What would tell us what
+## What the columns mean
 
-- Fewer `deadman` but `path` still always `lan` -> #1/#4 did the work, and the
-  outbound-asymmetry theory behind #3 needs revisiting.
-- `path` shows `relay:` during stalls and `deadman` drops -> #3 is working.
-- `ffmpeg_died` and `mtx_nostream` drop but `deadman` unchanged -> #4 only.
-- Nothing improves -> the remaining cause is upstream of all of this (camera
-  radio / AP behaviour), and the next move is physical, not code.
+- `deadman` / `ffmpeg_died` / `other_err` — session deaths. True per-window
+  counts; the trustworthy headline.
+- `mtx_nostream` — HA-visible failures. Each is a rejected DESCRIBE, i.e. a
+  camera card showing "wrong response on DESCRIBE".
+- `dup_pct` — share of received KCP segments that were duplicates. Rises when
+  the camera is retransmitting. Cumulative per session, so it resets on
+  reconnect and drifts within a session; compare at similar session age.
+- `rcvNxt` — packets this session. Going backwards means a new session, which
+  is how session lifetimes above were derived.
+- `path` — `lan` or `relay:<ip>`, based on where data arrived from.
+
+## Open, as of 09-22
+
+- **kitchen_cam is drifting.** deadman by day: 09-19 2, 09-20 5, 09-21 5, while
+  front_window stayed at 1-3. `mtx_nostream` appeared 09-20 (6) and 09-21 (56),
+  kitchen only. Still far better than baseline. `dup_pct` stays low, so this
+  looks environmental (Wi-Fi) rather than protocol.
+- **Discovery could not recover from a failed startup** — fixed 09-22 after a
+  DNS outage left both cameras down ~4.5h. See the commit; discovery now
+  retries and `/health` reports empty camera lists.
+- **Sampling gaps:** ~538 samples/day against 576 expected (~7%), so event
+  counts are slight undercounts. Log rotation added 09-22, which should help —
+  unbounded logs made `docker logs --since` slow enough to miss windows.
+
+`health.csv.v1` holds the original 13-day window under the old schema.

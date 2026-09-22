@@ -16,7 +16,7 @@ MTX=wyze-gwell-combined-mediamtx-1
 mkdir -p "$OUTDIR"
 
 if [ ! -f "$CSV" ]; then
-  echo "ts,camera,deadman,ffmpeg_died,other_err,started,mtx_publish,mtx_nostream,dropOld,rcvNxt,dup_pct,meter_sent,meter_ack,ack_pct,path" >> "$CSV"
+  echo "ts,camera,deadman,ffmpeg_died,other_err,started,mtx_publish,mtx_nostream,dropOld,rcvNxt,dup_pct,meter_sent,path" >> "$CSV"
 fi
 
 sample() {
@@ -47,12 +47,14 @@ sample() {
     [ -z "$drop" ] && drop=0
     dup=$(awk -v d="$drop" -v r="$rcv" 'BEGIN{t=d+r; printf "%.1f", (t>0)? d*100/t : 0}')
 
+    # meter_sent is kept only as a session-age proxy: it climbs for the life of
+    # a session. recvACK/ack_pct were removed — recvACK stops incrementing after
+    # handshake while sent climbs forever, so the ratio decays toward zero no
+    # matter how healthy the link is. It read as "outbound path broken" for 13
+    # days while dup_pct at 0.5% showed the camera was receiving our ACKs fine.
     ml=$(printf '%s\n' "$cl" | grep 'meter:' | tail -1)
     msent=$(printf '%s\n' "$ml" | grep -o 'sent=[0-9]*' | cut -d= -f2)
-    mack=$(printf '%s\n' "$ml" | grep -o 'recvACK=[0-9]*' | cut -d= -f2)
     [ -z "$msent" ] && msent=0
-    [ -z "$mack" ] && mack=0
-    ackpct=$(awk -v a="$mack" -v s="$msent" 'BEGIN{printf "%.1f", (s>0)? a*100/s : 0}')
 
     # Did the relay fallback actually carry traffic? A non-192.168 source means
     # we were receiving over the relay rather than LAN direct.
@@ -63,7 +65,7 @@ sample() {
       *) path="relay:$src" ;;
     esac
 
-    echo "$ts,$name,$deadman,$ffdied,$othererr,$started,$mtxpub,$mtxno,$drop,$rcv,$dup,$msent,$mack,$ackpct,$path" >> "$CSV"
+    echo "$ts,$name,$deadman,$ffdied,$othererr,$started,$mtxpub,$mtxno,$drop,$rcv,$dup,$msent,$path" >> "$CSV"
   done
 
   # Keep raw lifecycle lines so outage durations can be reconstructed later.
