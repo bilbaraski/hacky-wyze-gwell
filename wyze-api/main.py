@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import logging
 from typing import Optional, Dict
 import json
@@ -45,6 +46,12 @@ MARS_REGISTER_GW_USER_ROUTE = os.getenv("MARS_REGISTER_GW_USER_ROUTE", "/plugin/
 # Original C# defaults: GW_BE1_, GW_GC1_, GW_GC2_. Using broader GW_ to catch all GWELL variants (DUO, etc.)
 VALID_MARS_DEVICE_PREFIX = os.getenv("VALID_MARS_DEVICE_PREFIX", "GW_") # Comma separated
 LAN_SUBNET = os.getenv("LAN_SUBNET", "192.168.0.0/24")
+# Discovery retry cadence. EMPTY_RETRY_INTERVAL applies while we know about no
+# cameras at all (nothing can stream, so retry hard); REDISCOVER_INTERVAL is the
+# steady-state refresh that also picks up renames and cloud-reported IP changes.
+EMPTY_RETRY_INTERVAL = int(os.getenv("EMPTY_RETRY_INTERVAL", "60"))
+REDISCOVER_INTERVAL = int(os.getenv("REDISCOVER_INTERVAL", "900"))
+EMPTY_UNHEALTHY_AFTER = int(os.getenv("EMPTY_UNHEALTHY_AFTER", "600"))
 LAN_SCAN_INTERFACE = os.getenv("LAN_SCAN_INTERFACE", "eth0")
 
 # Models
@@ -138,6 +145,7 @@ class WyzeManager:
         # The IoTVideoSdk is very picky about this. Caching causes ASrv_tmpsubs_parse_fail (8020).
         self.supported_prefixes = [p.strip() for p in VALID_MARS_DEVICE_PREFIX.split(",") if p.strip()]
         self._ready = False  # Set True after startup prefetch completes
+        self._started_at = time.time()
         self._consecutive_mars_failures = 0
         self._max_mars_failures = int(os.getenv("MAX_MARS_FAILURES", "3"))
 
@@ -329,16 +337,34 @@ manager = WyzeManager()
 @app.on_event("startup")
 def startup_event():
     import threading
+
     def _init():
         try:
             manager.login()
             manager.refresh_cameras()
-            manager._ready = True
-            logger.info(f"API fully ready — {len(manager.cameras)} cameras discovered")
         except Exception as e:
             logger.exception(f"Startup init failed: {e}")
-            manager._ready = True
+        manager._ready = True
+        logger.info(f"API fully ready — {len(manager.cameras)} cameras discovered")
+
+    def _rediscover_loop():
+        """Discovery used to run once at startup. If it failed — a DNS blip
+        during a restart is enough — the camera list stayed empty for the life
+        of the process, DeviceInfo 404'd, and no stream could ever start, while
+        /health still reported ok. Keep retrying instead."""
+        while True:
+            try:
+                if not manager.cameras:
+                    time.sleep(EMPTY_RETRY_INTERVAL)
+                    logger.info("No cameras known — retrying discovery")
+                else:
+                    time.sleep(REDISCOVER_INTERVAL)
+                manager.refresh_cameras()
+            except Exception as e:
+                logger.exception(f"Rediscovery failed: {e}")
+
     threading.Thread(target=_init, daemon=True).start()
+    threading.Thread(target=_rediscover_loop, daemon=True).start()
 
 
 @app.get("/health")
@@ -349,6 +375,15 @@ def health():
         raise HTTPException(
             status_code=503,
             detail=f"Wyze Mars auth failing ({manager._consecutive_mars_failures} consecutive errors) — session likely expired"
+        )
+    # An empty camera list means every DeviceInfo lookup 404s and nothing can
+    # stream, so don't report healthy. Grace period so a restart during an
+    # outage retries quietly rather than getting restarted in a loop.
+    uptime = time.time() - manager._started_at
+    if not manager.cameras and uptime > EMPTY_UNHEALTHY_AFTER:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No cameras discovered after {int(uptime)}s — discovery is failing"
         )
     return {"status": "ok", "cameras": len(manager.cameras)}
 
